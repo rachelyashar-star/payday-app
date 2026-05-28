@@ -1,59 +1,84 @@
-# Priority ERP — MCP Connector
+# Priority ERP — MCP Connector (Pay Day)
 
-A custom [MCP](https://modelcontextprotocol.io) connector that lets Claude talk
-to **Priority ERP** through its OData REST API. Priority has no off-the-shelf
-Claude connector, so this wraps its API as an MCP server you can plug into
-Claude Code / Claude Desktop.
+A custom [MCP](https://modelcontextprotocol.io) connector that lets Claude push
+approved Pay Day invoices into **Priority ERP** as **supplier (A/P) invoices**,
+over Priority's OData REST API.
 
-## What Claude can do with it
+## Business logic (as agreed)
 
-| Tool | Purpose |
-|------|---------|
-| `priority_read_records` | Read records from any Priority entity (CUSTOMERS, ORDERS, AINVOICES, PART, …) with OData `$filter` / `$select` / `$expand` / `$orderby` / `$top`. Read-only. |
-| `priority_search` | Free-text, case-insensitive `contains` search across one or more fields of an entity. |
-| `priority_create_record` | Create a new record in an entity (writes to the ERP). |
+The connector implements this flow, on purpose, with safety rails for the
+initial rollout:
 
-## Prerequisites
+1. **Push trigger** — an invoice is sent to Priority once it is **approved**
+   in Pay Day (`clientApproved = true`) / via the "quick capture"
+   (קליטה מהירה) action.
+2. **Supplier matching** — find the supplier by name in Priority.
+3. **New supplier = manual, with preview** — if the supplier doesn't exist, the
+   connector does **NOT** create it automatically. It returns a **preview** of
+   the new supplier (with the next supplier number) for the bookkeeper to
+   approve; only then is it created.
+   - **Next supplier number** = continue from the last supplier in the system:
+     keep its prefix and add 1 to the sequence, e.g. `213-12` → `213-13`.
+4. **Duplicate check** — before creating, verify the invoice (supplier +
+   invoice number) doesn't already exist.
+5. **Draft only** — every document/transaction is created as a **DRAFT**
+   (טיוטה). Nothing is finalized and **no final journal entries** are posted.
 
-- **Node.js 20+** (uses the global `fetch`).
-- A Priority **API user** with OData REST access, and your environment's
-  OData base URL.
+> Once the logic is proven and debugged, the rollout flags in
+> `src/priorityConfig.js` (`autoCreateSuppliers`, `finalizeDocuments`,
+> `finalizeTransactions`) can be turned on to move to automatic creation and
+> final posting.
+
+## Tools
+
+| Tool | Writes? | Purpose |
+|------|:------:|---------|
+| `priority_describe_entity` | no | Get an entity's real field names + mandatory flags (`GetMetadataFor`). |
+| `priority_find_supplier` | no | Search the supplier master by name. |
+| `priority_preview_new_supplier` | no | Compute the next supplier number and return the record that *would* be created. Needs approval. |
+| `priority_create_supplier` | **yes** | Create the supplier — only after the preview is approved. |
+| `priority_check_invoice_exists` | no | Duplicate check for a supplier invoice. |
+| `priority_create_supplier_invoice` | **yes** | Create an approved invoice as a **DRAFT** A/P invoice (with dedup). |
+| `priority_read_records` | no | Generic OData read for ad-hoc queries. |
+
+## ⚠️ Field names must be confirmed
+
+The Priority entity/field names in `src/priorityConfig.js` (e.g. `PINVOICES`,
+`SUPNAME`, `IVNUM`, line subform fields) are **best-guess defaults**. They
+depend on your Priority version, language and customizations. Before relying on
+the create flows, run `priority_describe_entity` against `SUPPLIERS` and
+`PINVOICES` and adjust `priorityConfig.js` to match — that one file isolates all
+installation-specific names.
 
 ## Setup
 
 ```bash
 cd connectors/priority
 npm install
-cp .env.example .env   # then edit with your real credentials
+npm test                 # runs the supplier-numbering unit tests
+cp .env.example .env      # then edit with your real credentials
 ```
-
-Configure these (in `.env`, or directly in your MCP client config):
 
 | Variable | Description |
 |----------|-------------|
 | `PRIORITY_BASE_URL` | OData base, e.g. `https://<server>/odata/Priority/<tabula.ini>/<company>/` |
-| `PRIORITY_USERNAME` | Priority API user |
-| `PRIORITY_PASSWORD` | Priority API password |
+| `PRIORITY_USERNAME` | Priority **API user name** (Personnel File → API User Name), or a PAT |
+| `PRIORITY_PASSWORD` | The API password, or the literal `PAT` when the username is a token |
 
-> The connector uses **HTTP Basic Auth** over HTTPS. Use a dedicated,
-> least-privilege Priority user and keep `.env` out of git (it already is).
+Auth is HTTP Basic Auth over HTTPS (Priority's default). Use a dedicated,
+least-privilege API user.
 
 ## Connect it to Claude
 
 ### Claude Code (CLI)
-
 ```bash
 claude mcp add priority \
-  -e PRIORITY_BASE_URL="https://www.eshbelsaas.com/ui/odata/Priority/tabmob.ini/demo/" \
-  -e PRIORITY_USERNAME="your_api_user" \
-  -e PRIORITY_PASSWORD="your_api_password" \
+  -e PRIORITY_BASE_URL="https://<server>/odata/Priority/<tabula.ini>/<company>/" \
+  -e PRIORITY_USERNAME="..." -e PRIORITY_PASSWORD="..." \
   -- node /absolute/path/to/connectors/priority/src/index.js
 ```
 
-### Claude Desktop
-
-Add to `claude_desktop_config.json`:
-
+### Claude Desktop — `claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
@@ -61,45 +86,33 @@ Add to `claude_desktop_config.json`:
       "command": "node",
       "args": ["/absolute/path/to/connectors/priority/src/index.js"],
       "env": {
-        "PRIORITY_BASE_URL": "https://www.eshbelsaas.com/ui/odata/Priority/tabmob.ini/demo/",
-        "PRIORITY_USERNAME": "your_api_user",
-        "PRIORITY_PASSWORD": "your_api_password"
+        "PRIORITY_BASE_URL": "https://<server>/odata/Priority/<tabula.ini>/<company>/",
+        "PRIORITY_USERNAME": "...",
+        "PRIORITY_PASSWORD": "..."
       }
     }
   }
 }
 ```
 
-Restart Claude Desktop, then ask things like:
-- "Find the customer named ACME in Priority" → `priority_search`
-- "Show the 10 most recent orders over ₪1000" → `priority_read_records`
-- "Create a new customer ACME01 / ACME Ltd" → `priority_create_record`
+## Files
 
-## Example tool calls
-
-Read:
-```json
-{ "entity": "ORDERS", "filter": "TOTPRICE gt 1000", "orderby": "CURDATE desc", "top": 10 }
+```
+src/
+  index.js              # MCP server entry (stdio)
+  priorityClient.js     # low-level OData client (Basic Auth, GET/POST)
+  priorityConfig.js     # ⚙️ all entity/field names + rollout flags (edit here)
+  supplierNumbering.js  # pure logic: next supplier number (213-12 → 213-13)
+  payday.js             # orchestration: find/preview/create supplier, draft invoice
+  tools.js              # MCP tool definitions
+test/
+  supplierNumbering.test.js
 ```
 
-Search:
-```json
-{ "entity": "CUSTOMERS", "term": "acme", "fields": ["CUSTNAME", "CUSTDES"], "top": 20 }
-```
+## Notes
 
-Create:
-```json
-{ "entity": "CUSTOMERS", "fields": { "CUSTNAME": "ACME01", "CUSTDES": "ACME Ltd" } }
-```
-
-## Notes & next steps
-
-- **Entity & field names** are specific to your Priority configuration (and may
-  differ between Hebrew/English setups). Use `priority_read_records` with a small
-  `top` to discover the columns of an entity.
-- **Making it a remote connector** (so it shows up under *Settings → Connectors*
-  on claude.ai): replace `StdioServerTransport` in `src/index.js` with the
-  Streamable HTTP transport and host it behind HTTPS + OAuth. The tools in
-  `tools.js` stay unchanged.
-- **Write safety**: `priority_create_record` modifies live ERP data. Keep the
-  API user scoped to only the entities you intend to write.
+- Priority counts each create/update as a **transaction** (10k/month packages),
+  and throttles at 100 calls/min — the connector avoids redundant writes.
+- Dates are sent as DateTimeOffset; decimals use a `.` separator.
+- To enable a *remote* connector (claude.ai), swap `StdioServerTransport` in
+  `index.js` for Streamable HTTP + OAuth — the tools stay the same.

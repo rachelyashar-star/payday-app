@@ -1,169 +1,191 @@
 /**
  * tools.js
- * MCP tool definitions for the Priority connector.
+ * MCP tools for the Pay Day → Priority connector.
  *
- * Each tool is registered on the MCP server with a zod input schema and a
- * handler that returns MCP `content` blocks. Results are returned as pretty
- * JSON text so Claude can read and reason over them.
+ * The tools mirror the agreed business logic:
+ *   - Suppliers are created in two steps: preview (read-only) → create (after
+ *     bookkeeper approval). They are never created automatically.
+ *   - Invoices are pushed once approved in Pay Day, created as DRAFTS only
+ *     (no finalization, no final journal entries).
+ *   - Duplicates are checked before creating an invoice.
+ *
+ * Field/entity names live in priorityConfig.js and must be verified against
+ * the real Priority installation (use priority_describe_entity).
  */
 
 'use strict';
 
 const { z } = require('zod');
-const { readRecords, createRecord, searchRecords } = require('./priorityClient');
+const { readRecords, request } = require('./priorityClient');
+const {
+  findSupplierByName,
+  previewNewSupplier,
+  createSupplier,
+  checkInvoiceExists,
+  createSupplierInvoiceDraft,
+} = require('./payday');
 
-/**
- * Wrap a value as a single text content block.
- * @param {unknown} value
- * @returns {{ content: Array<{ type: 'text', text: string }> }}
- */
+/** Wrap a value as a single text content block (pretty JSON). */
 function textResult(value) {
-  const text =
-    typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   return { content: [{ type: 'text', text }] };
 }
 
-/**
- * Wrap an error as an MCP tool error result (isError: true) instead of
- * throwing, so Claude sees the message and can adjust its next call.
- * @param {unknown} err
- */
+/** Wrap an error as an MCP tool error result so Claude can adjust. */
 function errorResult(err) {
   const message = err instanceof Error ? err.message : String(err);
   return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
 }
 
+/** Run a handler, converting thrown errors into tool error results. */
+function safe(handler) {
+  return async (args) => {
+    try {
+      return textResult(await handler(args));
+    } catch (err) {
+      return errorResult(err);
+    }
+  };
+}
+
 /**
- * Register all Priority tools on the given MCP server.
+ * Register all Pay Day → Priority tools on the given MCP server.
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
  */
 function registerTools(server) {
-  // ─── Read data ──────────────────────────────────────────────────────
+  // ─── Discovery: confirm real field names ──────────────────────────
+  server.registerTool(
+    'priority_describe_entity',
+    {
+      title: 'Describe a Priority entity',
+      description:
+        'Return the metadata (fields, types, mandatory flags) for a Priority ' +
+        'entity via GetMetadataFor. Use this to confirm the real field names ' +
+        'before relying on the create flows.',
+      inputSchema: {
+        entity: z.string().describe('Top-level entity name, e.g. "SUPPLIERS" or "PINVOICES".'),
+      },
+    },
+    safe(async ({ entity }) =>
+      request('GET', `GetMetadataFor(entity='${entity.replace(/'/g, "''")}')`)
+    )
+  );
+
+  // ─── Suppliers ────────────────────────────────────────────────────
+  server.registerTool(
+    'priority_find_supplier',
+    {
+      title: 'Find a supplier',
+      description:
+        'Search the Priority supplier master by name (case-insensitive). ' +
+        'Use this first to check whether a vendor already exists before creating one.',
+      inputSchema: {
+        name: z.string().describe('Supplier name or fragment to search for.'),
+      },
+    },
+    safe(async ({ name }) => findSupplierByName(name))
+  );
+
+  server.registerTool(
+    'priority_preview_new_supplier',
+    {
+      title: 'Preview a new supplier (no write)',
+      description:
+        'PREVIEW ONLY — does NOT create anything. Computes the next supplier ' +
+        'number (continuing from the last supplier in the system: same prefix, ' +
+        'sequence + 1, e.g. 213-12 → 213-13) and returns the record that WOULD ' +
+        'be created. The bookkeeper must approve this preview before you call ' +
+        'priority_create_supplier.',
+      inputSchema: {
+        name: z.string().describe('Name for the new supplier (from the invoice vendor).'),
+      },
+    },
+    safe(async ({ name }) => previewNewSupplier(name))
+  );
+
+  server.registerTool(
+    'priority_create_supplier',
+    {
+      title: 'Create a supplier (after approval)',
+      description:
+        'Creates a supplier in Priority. Call this ONLY after a bookkeeper has ' +
+        'approved the preview from priority_preview_new_supplier. Pass the exact ' +
+        'record from that preview.',
+      inputSchema: {
+        supplierRecord: z
+          .record(z.any())
+          .describe('The approved supplier record, e.g. { "SUPNAME": "213-13", "SUPDES": "ACME Ltd" }.'),
+      },
+    },
+    safe(async ({ supplierRecord }) => createSupplier(supplierRecord))
+  );
+
+  // ─── Invoices ─────────────────────────────────────────────────────
+  server.registerTool(
+    'priority_check_invoice_exists',
+    {
+      title: 'Check if a supplier invoice exists',
+      description:
+        'Duplicate check: returns whether a supplier invoice with the given ' +
+        'supplier number and invoice number already exists in Priority.',
+      inputSchema: {
+        supplierNumber: z.string().describe('Priority supplier number (SUPNAME).'),
+        invoiceNumber: z.string().describe("The supplier's invoice number (IVNUM)."),
+      },
+    },
+    safe(async ({ supplierNumber, invoiceNumber }) =>
+      checkInvoiceExists(supplierNumber, invoiceNumber)
+    )
+  );
+
+  server.registerTool(
+    'priority_create_supplier_invoice',
+    {
+      title: 'Create a supplier invoice (DRAFT)',
+      description:
+        'Creates an approved Pay Day invoice in Priority as a supplier (A/P) ' +
+        'invoice. The supplier must already exist (use priority_find_supplier; ' +
+        'if missing, preview + create the supplier first). Runs a duplicate ' +
+        'check, then creates the document as a DRAFT (טיוטה) — it is NOT ' +
+        'finalized and NO final journal entries are posted.',
+      inputSchema: {
+        supplierNumber: z.string().describe('Existing Priority supplier number (SUPNAME).'),
+        invoiceNumber: z.string().describe("The supplier's invoice number (IVNUM)."),
+        invoiceDate: z.string().optional().describe('Invoice date "YYYY-MM-DD".'),
+        dueDate: z.string().optional().describe('Payment due date "YYYY-MM-DD".'),
+        currency: z
+          .enum(['ILS', 'USD', 'EUR', 'GBP'])
+          .optional()
+          .describe('Pay Day currency code.'),
+        amountPreVat: z.number().optional().describe('Amount before VAT.'),
+        vatAmount: z.number().optional().describe('VAT amount.'),
+        totalAmount: z.number().optional().describe('Total including VAT.'),
+        description: z.string().optional().describe('Line description.'),
+      },
+    },
+    safe(async (args) => createSupplierInvoiceDraft(args))
+  );
+
+  // ─── Generic read (fallback / ad-hoc queries) ─────────────────────
   server.registerTool(
     'priority_read_records',
     {
       title: 'Read Priority records',
       description:
-        'Read records from a Priority ERP entity (form/screen), e.g. CUSTOMERS, ' +
-        'ORDERS, AINVOICES, PART. Supports OData filtering, field selection, ' +
-        'related-entity expansion, ordering and a row limit. Read-only.',
+        'Read records from any Priority entity with OData options ' +
+        '($filter, $select, $expand, $orderby, $top). Read-only.',
       inputSchema: {
-        entity: z
-          .string()
-          .describe('Priority entity/form name, e.g. "CUSTOMERS" or "ORDERS".'),
-        filter: z
-          .string()
-          .optional()
-          .describe(
-            "Raw OData $filter expression, e.g. \"CUSTNAME eq 'ACME'\" or " +
-              "\"TOTPRICE gt 1000\"."
-          ),
-        select: z
-          .string()
-          .optional()
-          .describe('Comma-separated fields to return ($select), e.g. "CUSTNAME,CUSTDES".'),
-        expand: z
-          .string()
-          .optional()
-          .describe('Comma-separated related sub-entities to include ($expand).'),
-        orderby: z
-          .string()
-          .optional()
-          .describe('OrderBy expression, e.g. "CURDATE desc".'),
-        top: z
-          .number()
-          .int()
-          .positive()
-          .max(500)
-          .optional()
-          .describe('Maximum number of records to return (default server side; max 500).'),
+        entity: z.string().describe('Entity/form name, e.g. "SUPPLIERS".'),
+        filter: z.string().optional().describe('OData $filter expression.'),
+        select: z.string().optional().describe('Comma-separated fields ($select).'),
+        expand: z.string().optional().describe('Comma-separated subforms ($expand).'),
+        orderby: z.string().optional().describe('Order expression, e.g. "CURDATE desc".'),
+        top: z.number().int().positive().max(500).optional().describe('Max records (≤500).'),
       },
     },
-    async ({ entity, filter, select, expand, orderby, top }) => {
-      try {
-        const result = await readRecords(entity, {
-          filter,
-          select,
-          expand,
-          orderby,
-          top: top ?? 50,
-        });
-        return textResult(result);
-      } catch (err) {
-        return errorResult(err);
-      }
-    }
-  );
-
-  // ─── General search ─────────────────────────────────────────────────
-  server.registerTool(
-    'priority_search',
-    {
-      title: 'Search Priority records',
-      description:
-        'Free-text search within a Priority entity. Performs a case-insensitive ' +
-        '"contains" match across the given field(s) and returns matching records. ' +
-        'Use this when you have a name/number fragment but not an exact value.',
-      inputSchema: {
-        entity: z
-          .string()
-          .describe('Priority entity/form name to search, e.g. "CUSTOMERS".'),
-        term: z.string().describe('Text fragment to search for.'),
-        fields: z
-          .array(z.string())
-          .min(1)
-          .describe(
-            'Fields to search within, e.g. ["CUSTNAME","CUSTDES"]. Combined with OR.'
-          ),
-        top: z
-          .number()
-          .int()
-          .positive()
-          .max(500)
-          .optional()
-          .describe('Maximum number of records to return (max 500).'),
-      },
-    },
-    async ({ entity, term, fields, top }) => {
-      try {
-        const result = await searchRecords(entity, term, fields, { top: top ?? 50 });
-        return textResult(result);
-      } catch (err) {
-        return errorResult(err);
-      }
-    }
-  );
-
-  // ─── Create records ─────────────────────────────────────────────────
-  server.registerTool(
-    'priority_create_record',
-    {
-      title: 'Create a Priority record',
-      description:
-        'Create a new record in a Priority entity (form), e.g. a new customer in ' +
-        'CUSTOMERS or a new order in ORDERS. Provide the fields as a key/value ' +
-        'object matching the Priority column names. This writes to the ERP — ' +
-        'confirm the values with the user before calling.',
-      inputSchema: {
-        entity: z
-          .string()
-          .describe('Priority entity/form name to insert into, e.g. "CUSTOMERS".'),
-        fields: z
-          .record(z.any())
-          .describe(
-            'Field/value map using Priority column names, e.g. ' +
-              '{ "CUSTNAME": "ACME01", "CUSTDES": "ACME Ltd" }.'
-          ),
-      },
-    },
-    async ({ entity, fields }) => {
-      try {
-        const created = await createRecord(entity, fields);
-        return textResult({ created });
-      } catch (err) {
-        return errorResult(err);
-      }
-    }
+    safe(async ({ entity, filter, select, expand, orderby, top }) =>
+      readRecords(entity, { filter, select, expand, orderby, top: top ?? 50 })
+    )
   );
 }
 

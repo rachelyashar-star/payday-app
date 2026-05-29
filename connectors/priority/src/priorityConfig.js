@@ -40,8 +40,10 @@ const PRIORITY = {
   },
 
   // ─── A/P (supplier / purchase) invoice (חשבונית ספק) ──────────────
-  // NOTE: Sales invoices are AINVOICES; supplier/purchase invoices are
-  // typically PINVOICES. ⚠️ Confirm the entity + the field/subform names.
+  // In Priority Web these are viewed from the "כל החשבוניות" (All Invoices)
+  // screen. The entity behind that screen may NOT be PINVOICES — confirm via
+  // priority_describe_entity or a live Priority Web URL, then update `entity`.
+  // ⚠️ Confirm the entity + all field/subform names below.
   apInvoice: {
     entity: 'PINVOICES',
     supplierField: 'SUPNAME', // link to the supplier

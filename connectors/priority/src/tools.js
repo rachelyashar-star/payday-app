@@ -143,11 +143,12 @@ function registerTools(server) {
     {
       title: 'Create a supplier invoice (DRAFT)',
       description:
-        'Creates an approved Pay Day invoice in Priority as a supplier (A/P) ' +
-        'invoice. The supplier must already exist (use priority_find_supplier; ' +
-        'if missing, preview + create the supplier first). Runs a duplicate ' +
-        'check, then creates the document as a DRAFT (טיוטה) — it is NOT ' +
-        'finalized and NO final journal entries are posted.',
+        'Creates a captured Pay Day invoice in Priority as a supplier (A/P) ' +
+        'invoice. Capture is independent of payment approval. The supplier ' +
+        'must already exist (use priority_find_supplier; if missing, preview + ' +
+        'create the supplier first). Runs a duplicate check, then creates the ' +
+        'document as a DRAFT (טיוטה) — it is NOT finalized and NO final journal ' +
+        'entries are posted.',
       inputSchema: {
         supplierNumber: z.string().describe('Existing Priority supplier number (SUPNAME).'),
         invoiceNumber: z.string().describe("The supplier's invoice number (IVNUM)."),

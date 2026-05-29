@@ -9,9 +9,10 @@ over Priority's OData REST API.
 The connector implements this flow, on purpose, with safety rails for the
 initial rollout:
 
-1. **Push trigger** — an invoice is sent to Priority once it is **approved**
-   in Pay Day (`clientApproved = true`) / via the "quick capture"
-   (קליטה מהירה) action.
+1. **Capture trigger (separate from payment approval)** — invoice capture is
+   independent of Pay Day's payment approvals. An invoice is pushed to Priority
+   when it is captured via the "quick capture" (קליטה מהירה) action, which
+   creates a **draft** transaction.
 2. **Supplier matching** — find the supplier by name in Priority.
 3. **New supplier = manual, with preview** — if the supplier doesn't exist, the
    connector does **NOT** create it automatically. It returns a **preview** of

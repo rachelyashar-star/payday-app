@@ -21,6 +21,9 @@ const {
   findSupplierByName,
   previewNewSupplier,
   createSupplier,
+  searchExpenseAccounts,
+  isExpenseAccountAvailable,
+  createExpenseAccount,
   checkInvoiceExists,
   createSupplierInvoiceDraft,
 } = require('./payday');
@@ -118,6 +121,54 @@ function registerTools(server) {
       },
     },
     safe(async ({ supplierRecord }) => createSupplier(supplierRecord))
+  );
+
+  // ─── Expense accounts ─────────────────────────────────────────────
+  server.registerTool(
+    'priority_search_expense_accounts',
+    {
+      title: 'Search expense accounts',
+      description:
+        'Search the chart of accounts for expense accounts by number or ' +
+        'description (for the dropdown shown when assigning an account to a ' +
+        'new supplier/invoice). Empty term lists the top accounts. Read-only.',
+      inputSchema: {
+        term: z.string().optional().describe('Account number or description fragment.'),
+      },
+    },
+    safe(async ({ term }) => searchExpenseAccounts(term))
+  );
+
+  server.registerTool(
+    'priority_check_account_available',
+    {
+      title: 'Check expense-account number availability',
+      description:
+        'Check whether an expense-account number is free before opening a new ' +
+        'account. Returns { available, existing }.',
+      inputSchema: {
+        accountNumber: z.string().describe('The account number to check.'),
+      },
+    },
+    safe(async ({ accountNumber }) => isExpenseAccountAvailable(accountNumber))
+  );
+
+  server.registerTool(
+    'priority_create_expense_account',
+    {
+      title: 'Create a new expense account',
+      description:
+        'Open a new expense account with a bookkeeper-chosen number. Verifies ' +
+        'the number is free first; if it is already taken, fails with ' +
+        '"account number taken" (מספר החשבון תפוס).',
+      inputSchema: {
+        accountNumber: z.string().describe('The account number the bookkeeper typed.'),
+        accountName: z.string().describe('The account description/name.'),
+      },
+    },
+    safe(async ({ accountNumber, accountName }) =>
+      createExpenseAccount(accountNumber, accountName)
+    )
   );
 
   // ─── Invoices ─────────────────────────────────────────────────────

@@ -59,6 +59,20 @@ const PRIORITY = {
     },
   },
 
+  // ─── Expense / G-L accounts (חשבונות הוצאה / כרטיסי חשבון) ─────────
+  // Unlike suppliers, expense-account numbers are NOT auto-incremented:
+  // the bookkeeper types a number manually, and we only verify it is free
+  // before creating (otherwise → "account number taken").
+  expenseAccount: {
+    entity: 'ACCOUNTS', // chart-of-accounts form           ⚠️ verify
+    keyField: 'ACCNAME', // account number                  ⚠️ verify
+    nameField: 'ACCDES', // account description             ⚠️ verify
+    // Optional OData filter to limit results to EXPENSE accounts only
+    // (the chart of accounts also holds assets, income, etc.). Leave empty
+    // until the right field/value for expense accounts is confirmed. ⚠️ verify
+    expenseFilter: '',
+  },
+
   // Map Pay Day currency codes (ILS/USD/EUR/GBP) to Priority currency codes.
   // ⚠️ Priority currency codes are configured per installation — confirm them.
   currencyMap: {

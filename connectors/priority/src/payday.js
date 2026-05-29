@@ -144,6 +144,70 @@ async function createSupplier(supplierRecord) {
 }
 
 /**
+ * Search existing expense / G-L accounts by number or description, for the
+ * "expense account" dropdown shown when capturing a new supplier's invoice.
+ * @param {string} [term] number or description fragment (empty = list top accounts)
+ * @returns {Promise<{ count: number, records: object[] }>}
+ */
+async function searchExpenseAccounts(term) {
+  const { entity, keyField, nameField, expenseFilter } = PRIORITY.expenseAccount;
+  const clauses = [];
+  if (term) {
+    const t = odataString(term).toLowerCase();
+    clauses.push(
+      `(contains(tolower(${keyField}),'${t}') or contains(tolower(${nameField}),'${t}'))`
+    );
+  }
+  if (expenseFilter) clauses.push(`(${expenseFilter})`);
+  return readRecords(entity, {
+    filter: clauses.join(' and ') || undefined,
+    select: `${keyField},${nameField}`,
+    top: 50,
+  });
+}
+
+/**
+ * Check whether an expense-account number is free (not yet in use).
+ * @param {string} accountNumber
+ * @returns {Promise<{ available: boolean, existing: object|null }>}
+ */
+async function isExpenseAccountAvailable(accountNumber) {
+  const { entity, keyField, nameField } = PRIORITY.expenseAccount;
+  const { count, records } = await readRecords(entity, {
+    filter: `${keyField} eq '${odataString(accountNumber)}'`,
+    select: `${keyField},${nameField}`,
+    top: 1,
+  });
+  return { available: count === 0, existing: count > 0 ? records[0] : null };
+}
+
+/**
+ * Create a new expense account with a bookkeeper-chosen number, after first
+ * verifying the number is free. Throws "account number taken" if it isn't.
+ * @param {string} accountNumber the number the bookkeeper typed
+ * @param {string} accountName   the account description
+ * @returns {Promise<{ created: true, record: object }>}
+ */
+async function createExpenseAccount(accountNumber, accountName) {
+  const { entity, keyField, nameField } = PRIORITY.expenseAccount;
+  if (!accountNumber) {
+    throw new Error('createExpenseAccount requires an account number.');
+  }
+  const { available, existing } = await isExpenseAccountAvailable(accountNumber);
+  if (!available) {
+    throw new Error(
+      `מספר החשבון תפוס — account number ${accountNumber} is already taken` +
+        (existing && existing[nameField] ? ` ("${existing[nameField]}").` : '.')
+    );
+  }
+  const record = await createRecord(entity, {
+    [keyField]: accountNumber,
+    [nameField]: accountName,
+  });
+  return { created: true, record };
+}
+
+/**
  * Check whether a supplier invoice already exists (dedup), to avoid 409
  * conflicts and double-posting.
  * @param {string} supplierNumber
@@ -230,6 +294,9 @@ module.exports = {
   getLastSupplier,
   previewNewSupplier,
   createSupplier,
+  searchExpenseAccounts,
+  isExpenseAccountAvailable,
+  createExpenseAccount,
   checkInvoiceExists,
   createSupplierInvoiceDraft,
   // exported for testing / reuse
